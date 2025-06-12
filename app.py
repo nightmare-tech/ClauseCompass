@@ -91,65 +91,52 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     
 
 @app.post("/chat")
-def chat(chat_req: ChatRequest, user_document=Depends(get_current_user)): # user_document is the dict from DB
+def chat(chat_req: ChatRequest, user_document=Depends(get_current_user)): 
 
-    # chat_history_from_db is a list of dictionaries
     chat_history_from_db = user_document.get("chat_history", [])
 
-    if not isinstance(chat_history_from_db, list): # Basic check
-        # This case should ideally be handled by ensuring chat_history is always initialized as a list
+    if not isinstance(chat_history_from_db, list): 
         chat_history_from_db = []
 
-    # 1. Prepare messages for AI21 client (list of ChatMessage objects)
     messages_for_ai = []
     for msg_dict in chat_history_from_db:
         content_for_ai = msg_dict.get("content", "")
         role_for_ai = msg_dict.get("role")
-        if not role_for_ai: continue # Skip if role is missing
+        if not role_for_ai: continue 
 
-        # Append timestamp to content for historical user/assistant messages, as per system prompt
-        # System prompt itself is passed as is.
         if role_for_ai != "system" and "timestamp" in msg_dict:
             content_for_ai = f"{content_for_ai} (timestamp: {msg_dict['timestamp']})"
         
         messages_for_ai.append(ChatMessage(role=role_for_ai, content=content_for_ai))
 
-    # 2. Current user's message (as ChatMessage object for AI)
-    # The system prompt implies AI should see timestamps in content
     current_time_iso = datetime.now().isoformat()
     current_user_message_content_for_ai = f"{chat_req.message} (timestamp: {current_time_iso})"
     current_user_ai_message_object = ChatMessage(role="user", content=current_user_message_content_for_ai)
     messages_for_ai.append(current_user_ai_message_object)
 
-    # 3. Call AI21 API
     try:
-        ai_response_obj = client.chat.completions.create( # Renamed to avoid conflict
+        ai_response_obj = client.chat.completions.create( 
             model="jamba-mini-1.6-2025-03",
-            messages=messages_for_ai # This is now list[ChatMessage]
+            messages=messages_for_ai 
         )
     except Exception as e:
-        # Log the error for server-side debugging
-        print(f"AI21 API Error: {e}") # Consider using proper logging
+        print(f"AI21 API Error: {e}") 
         raise HTTPException(status_code=503, detail="Error communicating with AI service.")
 
     ai_reply_content = ai_response_obj.choices[0].message.content
 
-    # 4. Prepare messages for DB storage (as dictionaries)
-    # User's message for DB (store original content + separate timestamp)
     db_user_message_to_store = {
         "role": "user",
-        "content": chat_req.message, # Original message without appended timestamp
-        "timestamp": current_time_iso # Timestamp of this message
+        "content": chat_req.message, 
+        "timestamp": current_time_iso 
     }
 
-    # AI's reply for DB
     db_ai_reply_to_store = {
         "role": "assistant",
         "content": ai_reply_content,
-        "timestamp": datetime.now().isoformat() # Timestamp of AI's reply
+        "timestamp": datetime.now().isoformat() 
     }
 
-    # 5. Update DB atomically using the correct field name "chat_history"
     users_col.update_one(
         {"userid": user_document["userid"]},
         {"$push": {"chat_history": {"$each": [db_user_message_to_store, db_ai_reply_to_store]}}}
