@@ -3,3 +3,4 @@ chroma_db_store/
 config.json
 data.json
 __pycache__/
+.env
