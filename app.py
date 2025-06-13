@@ -204,18 +204,19 @@ async def chat_endpoint( # Changed to async for good practice, though AI21 might
                 logger.debug(f"Constructed context_for_llm_str (first 200 chars): {context_for_llm_str[:200]}")
 
                 system_prompt_rag = (
-                    "You are an AI assistant for Company XYZ. Your task is to answer the user's question using ONLY the information found in the 'Provided Company XYZ Documents Context' below. "
+                    "You are an AI assistant for Company XYZ. Your task is to answer the user's question using the information found in the 'Provided Company XYZ Documents Context' AND the CHAT HISTORY provided below ONLY "
                     "Synthesize an answer based on these documents. "
-                    "If the documents do not contain enough information to answer the question, explicitly state: "
+                    "If the documents or the CHAT HISTORY do not contain enough information to answer the question, explicitly state: "
                     f"'{OUT_OF_KB_SCOPE_MESSAGE}'. "
                     "Do not use any external knowledge. Do not discuss other companies."
+                    f"CHAT HISTORY START\n\n{historical_ai21_messages}\n\nCHAT HISTORY END\n"
                     f"{context_for_llm_str}"
                 )                
 
                 # In the RAG positive path (if current_query_docs and ...):
 
                 # ... (system_prompt_rag is constructed with context_for_llm_str) ...
-                logger.debug(f"Constructed system_prompt_rag (first 200 chars): {system_prompt_rag[:200]}")
+                logger.info(f"Constructed system_prompt_rag (first 200 chars): {system_prompt_rag}")
 
                 # --- REVISED PAYLOAD CONSTRUCTION ---
                 final_messages_for_ai21 = [
@@ -294,8 +295,6 @@ async def register_user_endpoint(registration_data: RegisterUser): # Changed to 
                 "timestamp": initial_system_message_timestamp
             }
         ],
-        "created_at": current_time_utc,
-        "updated_at": current_time_utc
     }
     users_collection.insert_one(user_document)
     return {"message": "User registered successfully", "userid": registration_data.userid}
