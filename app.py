@@ -12,8 +12,9 @@ from pydantic import BaseModel
 from ai21 import AI21Client
 from ai21.models.chat import ChatMessage
 from dotenv import load_dotenv
+import json
 # from starlette.types import HTTPExceptionHandler # Unused, can be removed
-import chromadb
+from sentence_transformers import SentenceTransformer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -54,36 +55,24 @@ except Exception as e:
 
 db = mongo_client_instance["chattydb"]
 users_collection = db["users"]
-
-# --- ChromaDB Configuration ---
-CHROMA_DB_PATH = "./chroma_db_store"
-COMPANY_KB_COLLECTION_NAME = "company_internal_kb"
-DISTANCE_THRESHOLD_COSINE = 1
-OUT_OF_KB_SCOPE_MESSAGE = "I am designed to answer questions based on Company XYZ's internal documents. I do not have information on that topic."
-# embedding_function_to_use = None # Not needed if relying on Chroma's default for this app
-company_kb_collection = None
-
+MONGO_KB_COLLECTION_NAME = "company_kb_vectorized" # Same as in ingest_kb.py
+mongo_kb_collection = db[MONGO_KB_COLLECTION_NAME]
+EMBEDDING_MODEL_NAME_APP = 'all-MiniLM-L6-v2'
 try:
-    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    logger.info(f"ChromaDB PersistentClient initialized at {CHROMA_DB_PATH}.")
-    # IMPORTANT: Ensure this matches how injest_kb.py creates/accesses the collection
-    # If injest_kb.py does NOT pass an embedding_function, Chroma uses its default.
-    # So, here too, we should NOT pass embedding_function to use the same default.
-    company_kb_collection = chroma_client.get_or_create_collection(
-        name=COMPANY_KB_COLLECTION_NAME,
-        # embedding_function=embedding_function_to_use, # OMITTED to use Chroma's default
-        metadata={"hnsw:space": "cosine"}
-    )
-    logger.info(f"ChromaDB collection '{COMPANY_KB_COLLECTION_NAME}' loaded/created (using default EF).")
-    logger.info(f"Collection count: {company_kb_collection.count()}")
+    app_embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME_APP)
+    logger.info(f"FastAPI App: Initialized Sentence Transformer embedding model: {EMBEDDING_MODEL_NAME_APP}")
 except Exception as e:
-    logger.error(f"Failed to initialize ChromaDB client or collection: {e}", exc_info=True)
-    # company_kb_collection remains None, will be handled in /chat
+    logger.error(f"FastAPI App: Failed to load embedding model '{EMBEDDING_MODEL_NAME_APP}': {e}", exc_info=True)
+    app_embedding_model = None
+
+ATLAS_VECTOR_SEARCH_INDEX_NAME = "vector_index_for_kb"
+MONGO_SCORE_THRESHOLD = 0.5
+OUT_OF_KB_SCOPE_MESSAGE = "I am designed to answer questions based on Company XYZ's internal documents. I do not have information on that topic."
 
 # --- Security and JWT Configuration ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 # Now used by create_access_token
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 class ChatRequest(BaseModel):
     message: str
@@ -158,106 +147,109 @@ async def chat_endpoint( # Changed to async for good practice, though AI21 might
     user_query = chat_req.message
     ai_response_content = ""
     used_knowledge_base = False
-    # final_messages_for_ai21 is built inside the conditional logic now
+    final_messages_for_ai21 = []
 
     historical_ai21_messages = []
     for msg_dict in user_chat_history_from_db:
         role = msg_dict.get("role", "user") # Default to user if role somehow missing
-        content = msg_dict.get("content", "") # Default to empty string if content missing
-        if not isinstance(content, str): # Ensure content is a string
-            logger.warning(f"Historical message content was not a string ({type(content)}), converting. Content: {content}")
-            content = str(content)
+        content = str(msg_dict.get("content", "")) # Default to empty string if content missing
         historical_ai21_messages.append(ChatMessage(role=role, content=content))
 
-    if company_kb_collection is None:
-        logger.error("ChromaDB collection is not available for RAG. Responding with out-of-scope message.")
+    if app_embedding_model is None:
+        logger.error("FastAPI App: Embedding model not available. Cannot perform KB lookup.")
         ai_response_content = OUT_OF_KB_SCOPE_MESSAGE
     else:
         try:
-            logger.debug(f"Querying ChromaDB collection '{COMPANY_KB_COLLECTION_NAME}' for: '{user_query}'")
-            retrieved_kb_results = company_kb_collection.query(
-                query_texts=[user_query],
-                n_results=3,
-                include=["documents", "distances"]
-            )
-            logger.info(f"ChromaDB results: {retrieved_kb_results}")
+            logger.debug(f"Generating embedding for user query: '{user_query}'")
+            user_query_embedding = app_embedding_model.encode(user_query).tolist() # Generate and convert to list
+            # MongoDB Atlas Vector Search Pipeline
+            vector_search_pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": ATLAS_VECTOR_SEARCH_INDEX_NAME, # The name of your Atlas Vector Index
+                        "path": "embedding_vector",         # Field in MongoDB containing the vectors
+                        "queryVector": user_query_embedding,
+                        "numCandidates": 100, # Number of candidates to consider
+                        "limit": 3            # Number of top results to return
+                    }
+                },
+                { # Project to get relevant fields and the search score
+                    "$project": {
+                        "_id": 0, # Exclude the default MongoDB _id
+                        "text_chunk": 1,
+                        "metadata": 1, # Contains source_document, page_number etc.
+                        "score": {"$meta": "vectorSearchScore"}
+                    }
+                }
+            ]
+            logger.debug(f"Executing MongoDB Vector Search against '{MONGO_KB_COLLECTION_NAME}' "
+                         f"with index '{ATLAS_VECTOR_SEARCH_INDEX_NAME}'.")
 
-            retrieved_docs_list = retrieved_kb_results.get('documents', []) # Default to empty list
-            retrieved_distances_list = retrieved_kb_results.get('distances', []) # Default to empty list
+            retrieved_mongo_results = list(mongo_kb_collection.aggregate(vector_search_pipeline))
+            logger.info(f"MongoDB Vector Search results count: {len(retrieved_mongo_results)}")
+            # if retrieved_mongo_results:
+            #     logger.debug(f"MongoDB Vector Search top result: {retrieved_mongo_results[0]}")
 
-            # Ensure these are lists of lists as expected, and access the first sub-list
-            current_query_docs = retrieved_docs_list[0] if retrieved_docs_list else []
-            current_query_distances = retrieved_distances_list[0] if retrieved_distances_list else []
 
-            if current_query_docs and current_query_distances and (current_query_distances[0] < DISTANCE_THRESHOLD_COSINE):
+            if retrieved_mongo_results and retrieved_mongo_results[0]['score'] >= MONGO_SCORE_THRESHOLD:
                 used_knowledge_base = True
-                logger.info(f"Relevant KB context found (distance: {current_query_distances[0]:.4f}). Augmenting prompt.")
-                logger.debug(f"Retrieved docs content for RAG: {current_query_docs}")
+                logger.info(f"Relevant KB context found from MongoDB (top score: {retrieved_mongo_results[0]['score']:.4f}). Augmenting prompt.")
 
-                context_for_llm_str = "\n--- Provided Company XYZ Documents Context ---\n"
-                for i, doc_text in enumerate(current_query_docs):
-                    if not isinstance(doc_text, str): # Ensure doc_text is a string
-                        logger.warning(f"Retrieved document text for RAG (index {i}) is not a string, converting: {type(doc_text)}")
-                        doc_text = str(doc_text)
-                    context_for_llm_str += f"Context Document {i+1}:\n{doc_text}\n\n"
+                context_for_llm_str = "\n--- Provided Company XYZ Documents Context (from MongoDB) ---\n"
+                for i, doc in enumerate(retrieved_mongo_results):
+                    text_chunk = doc.get("text_chunk", "Error: Text chunk missing")
+                    source_info = doc.get("metadata", {}).get("source_document", "Unknown source")
+                    page_info = doc.get("metadata", {}).get("page_number", "")
+                    context_for_llm_str += f"Context Document {i+1} (Source: {source_info}{f', Page: {page_info}' if page_info else ''}):\n{text_chunk}\n\n"
                 context_for_llm_str += "--- End of Provided Documents Context ---\n"
-                logger.debug(f"Constructed context_for_llm_str (first 200 chars): {context_for_llm_str[:200]}")
+                # logger.debug(f"Constructed context_for_llm_str (first 200 chars): {context_for_llm_str[:200]}")
 
                 system_prompt_rag = (
-                    "You are an AI assistant for Company XYZ. Your task is to answer the user's question using the information found in the 'Provided Company XYZ Documents Context' AND the CHAT HISTORY provided below ONLY "
+                    "You are an AI assistant for Company XYZ. Your task is to answer the user's question using the information found in the 'Provided Company XYZ Documents Context' AND the CHAT HISTORY provided below ONLY. "
                     "Synthesize an answer based on these documents. "
                     "If the documents or the CHAT HISTORY do not contain enough information to answer the question, explicitly state: "
                     f"'{OUT_OF_KB_SCOPE_MESSAGE}'. "
                     "Do not use any external knowledge. Do not discuss other companies."
-                    f"CHAT HISTORY START\n\n{historical_ai21_messages}\n\nCHAT HISTORY END\n"
+                    # The RAG payload now focuses on current query + context from DB
+                    # History is handled in the AI21 call if their model supports it well with system prompts.
+                    # For a cleaner RAG call, often history is omitted or summarized if too long.
+                    # Let's send history for now as per previous logic.
+                    f"CHAT HISTORY START\n\n{json.dumps([h.model_dump() if hasattr(h, 'model_dump') else h.dict() for h in historical_ai21_messages])}\n\nCHAT HISTORY END\n"
                     f"{context_for_llm_str}"
-                )                
+                )
+                final_messages_for_ai21.append(ChatMessage(role="system", content=system_prompt_rag))
+                # final_messages_for_ai21.extend(historical_ai21_messages) # History is now IN the system prompt for AI21
+                final_messages_for_ai21.append(ChatMessage(role="user", content=user_query))
 
-                # In the RAG positive path (if current_query_docs and ...):
-
-                # ... (system_prompt_rag is constructed with context_for_llm_str) ...
-                logger.info(f"Constructed system_prompt_rag (first 200 chars): {system_prompt_rag}")
-
-                # --- REVISED PAYLOAD CONSTRUCTION ---
-                final_messages_for_ai21 = [
-                    ChatMessage(role="system", content=system_prompt_rag),
-                    ChatMessage(role="user", content=user_query)
-                ]
-                logger.debug("Built a clean RAG payload (System Prompt + User Query). Chat history was intentionally excluded for this call.")                                
-                # Log the exact payload before sending
-                try:
-                    payload_log = [msg.model_dump() for msg in final_messages_for_ai21] # Pydantic v2
-                except AttributeError:
-                    payload_log = [msg.dict() for msg in final_messages_for_ai21] # Pydantic v1
-                logger.debug(f"Final messages for AI21 (RAG path) PAYLOAD: {payload_log}")
+                # Log payload before sending
+                # try: payload_log = [msg.model_dump() for msg in final_messages_for_ai21]
+                # except AttributeError: payload_log = [msg.dict() for msg in final_messages_for_ai21]
+                # logger.debug(f"Final messages for AI21 (MongoDB RAG path) PAYLOAD: {payload_log}")
 
                 ai_api_response = ai21_client.chat.completions.create(
                     model="jamba-mini-1.6-2025-03",
                     messages=final_messages_for_ai21
                 )
-                ai_response_content = ai_api_response.choices[0].message.content            
+                ai_response_content = ai_api_response.choices[0].message.content
             else:
-                log_distance = current_query_distances[0] if current_query_distances else 'N/A'
-                logger.info(f"KB context not found or below relevance threshold (best distance: {log_distance}). Responding with out-of-scope message.")
+                log_score = retrieved_mongo_results[0]['score'] if retrieved_mongo_results else 'N/A'
+                logger.info(f"KB context from MongoDB not found or below relevance threshold (best score: {log_score}). Responding with out-of-scope message.")
                 ai_response_content = OUT_OF_KB_SCOPE_MESSAGE
+
         except Exception as e:
-            logger.error(f"Error during ChromaDB query or AI21 call with RAG: {e}", exc_info=True)
+            logger.error(f"Error during MongoDB Vector Search or AI21 call: {e}", exc_info=True)
             ai_response_content = "Sorry, I encountered an error trying to process your request."
 
-    # --- Store interaction in MongoDB ---
+    # --- Store interaction in MongoDB (users_collection) ---
+    # ... (same as before, store db_user_message and db_ai_reply_message) ...
     current_timestamp_iso = datetime.now(timezone.utc).isoformat()
-    db_user_message = {
-        "role": "user",
-        "content": user_query,
-        "timestamp": current_timestamp_iso
-    }
+    db_user_message = { "role": "user", "content": user_query, "timestamp": current_timestamp_iso }
     db_ai_reply_message = {
         "role": "assistant",
-        "content": ai_response_content, # This will be the error message if an exception occurred above
+        "content": ai_response_content,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "used_knowledge_base": used_knowledge_base
     }
-
     try:
         users_collection.update_one(
             {"userid": current_user["userid"]},
