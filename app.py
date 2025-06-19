@@ -308,3 +308,5 @@ if __name__ == "__main__":
     import uvicorn
     logger.info("Starting FastAPI application with Uvicorn...")
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True) # Use string for reload
+
+    

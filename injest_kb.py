@@ -238,3 +238,5 @@ if __name__ == "__main__":
             )
     except Exception as e:
         logger.error(f"An error occurred during the ingestion process: {e}", exc_info=True)
+
+        
