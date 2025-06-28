@@ -8,7 +8,8 @@ from passlib.context import CryptContext
 from pymongo.mongo_client import MongoClient as MongoClientDB
 from pymongo.server_api import ServerApi
 from urllib.parse import quote_plus
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import List, Optional
 from ai21 import AI21Client
 from ai21.models.chat import ChatMessage
 from dotenv import load_dotenv
@@ -66,7 +67,7 @@ except Exception as e:
     app_embedding_model = None
 
 ATLAS_VECTOR_SEARCH_INDEX_NAME = "vector_index_for_kb"
-MONGO_SCORE_THRESHOLD = 0.5
+MONGO_SCORE_THRESHOLD = 0.60
 OUT_OF_KB_SCOPE_MESSAGE = "I am designed to answer questions based on Company XYZ's internal documents. I do not have information on that topic."
 
 # --- Security and JWT Configuration ---
@@ -76,6 +77,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 class ChatRequest(BaseModel):
     message: str
+    source_files: Optional[List[str]] = Field(default_factory=list)
 
 class RegisterUser(BaseModel):
     userid: str
@@ -163,16 +165,28 @@ async def chat_endpoint( # Changed to async for good practice, though AI21 might
             logger.debug(f"Generating embedding for user query: '{user_query}'")
             user_query_embedding = app_embedding_model.encode(user_query).tolist() # Generate and convert to list
             # MongoDB Atlas Vector Search Pipeline
-            vector_search_pipeline = [
-                {
-                    "$vectorSearch": {
-                        "index": ATLAS_VECTOR_SEARCH_INDEX_NAME, # The name of your Atlas Vector Index
-                        "path": "embedding_vector",         # Field in MongoDB containing the vectors
-                        "queryVector": user_query_embedding,
-                        "numCandidates": 100, # Number of candidates to consider
-                        "limit": 3            # Number of top results to return
+            vector_search_stage ={
+                "$vectorSearch": {
+                    "index": ATLAS_VECTOR_SEARCH_INDEX_NAME, # The name of your Atlas Vector Index
+                    "path": "embedding_vector",         # Field in MongoDB containing the vectors
+                    "queryVector": user_query_embedding,
+                    "numCandidates": 100, # Number of candidates to consider
+                    "limit": 5            # Number of top results to return
+                }
+            }
+            
+
+            if chat_req.source_files:
+                logger.info(f"Filtering vector search by source files: {chat_req.source_files}")
+                vector_search_stage["$vectorSearch"]["filter"] = {
+                    "metadata.source_document": { # The path to your source document field
+                        "$in": chat_req.source_files
                     }
-                },
+                }
+
+
+            vector_search_pipeline = [
+                vector_search_stage,
                 { # Project to get relevant fields and the search score
                     "$project": {
                         "_id": 0, # Exclude the default MongoDB _id
@@ -187,8 +201,8 @@ async def chat_endpoint( # Changed to async for good practice, though AI21 might
 
             retrieved_mongo_results = list(mongo_kb_collection.aggregate(vector_search_pipeline))
             logger.info(f"MongoDB Vector Search results count: {len(retrieved_mongo_results)}")
-            # if retrieved_mongo_results:
-            #     logger.debug(f"MongoDB Vector Search top result: {retrieved_mongo_results[0]}")
+            if retrieved_mongo_results:
+                logger.debug(f"MongoDB Vector Search top result: {retrieved_mongo_results[0]}")
 
 
             if retrieved_mongo_results and retrieved_mongo_results[0]['score'] >= MONGO_SCORE_THRESHOLD:
@@ -202,14 +216,12 @@ async def chat_endpoint( # Changed to async for good practice, though AI21 might
                     page_info = doc.get("metadata", {}).get("page_number", "")
                     context_for_llm_str += f"Context Document {i+1} (Source: {source_info}{f', Page: {page_info}' if page_info else ''}):\n{text_chunk}\n\n"
                 context_for_llm_str += "--- End of Provided Documents Context ---\n"
-                # logger.debug(f"Constructed context_for_llm_str (first 200 chars): {context_for_llm_str[:200]}")
+                logger.debug(f"Constructed context_for_llm_str (first 200 chars): {context_for_llm_str[:200]}")
 
                 system_prompt_rag = (
-                    "You are an AI assistant for Company XYZ. Your task is to answer the user's question using the information found in the 'Provided Company XYZ Documents Context' AND the CHAT HISTORY provided below ONLY. "
+                    "You are an AI assistant for Company XYZ. Your task is to answer the user's question using the information found in the 'Provided Company XYZ Documents Context' AND the CHAT HISTORY provided below. "
+                    "You can summarise the context and use it to answer the user's query."
                     "Synthesize an answer based on these documents. "
-                    "If the documents or the CHAT HISTORY do not contain enough information to answer the question, explicitly state: "
-                    f"'{OUT_OF_KB_SCOPE_MESSAGE}'. "
-                    "Do not use any external knowledge. Do not discuss other companies."
                     # The RAG payload now focuses on current query + context from DB
                     # History is handled in the AI21 call if their model supports it well with system prompts.
                     # For a cleaner RAG call, often history is omitted or summarized if too long.
@@ -222,9 +234,9 @@ async def chat_endpoint( # Changed to async for good practice, though AI21 might
                 final_messages_for_ai21.append(ChatMessage(role="user", content=user_query))
 
                 # Log payload before sending
-                # try: payload_log = [msg.model_dump() for msg in final_messages_for_ai21]
-                # except AttributeError: payload_log = [msg.dict() for msg in final_messages_for_ai21]
-                # logger.debug(f"Final messages for AI21 (MongoDB RAG path) PAYLOAD: {payload_log}")
+                try: payload_log = [msg.model_dump() for msg in final_messages_for_ai21]
+                except AttributeError: payload_log = [msg.dict() for msg in final_messages_for_ai21]
+                logger.debug(f"Final messages for AI21 (MongoDB RAG path) PAYLOAD: {payload_log}")
 
                 ai_api_response = ai21_client.chat.completions.create(
                     model="jamba-mini-1.6-2025-03",
@@ -241,7 +253,6 @@ async def chat_endpoint( # Changed to async for good practice, though AI21 might
             ai_response_content = "Sorry, I encountered an error trying to process your request."
 
     # --- Store interaction in MongoDB (users_collection) ---
-    # ... (same as before, store db_user_message and db_ai_reply_message) ...
     current_timestamp_iso = datetime.now(timezone.utc).isoformat()
     db_user_message = { "role": "user", "content": user_query, "timestamp": current_timestamp_iso }
     db_ai_reply_message = {
@@ -303,6 +314,15 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     token = create_access_token(data={"sub": user["userid"]}, expires_delta=access_token_expires)
     return {"access_token": token, "token_type": "bearer"}
+
+@app.get("/documents")
+async def list_available_documents(current_user: dict = Depends(get_current_user)):
+    try:
+        distinct_files = mongo_kb_collection.distinct("metadata.source_document")
+        return {"documents": distinct_files}
+    except Exception as e:
+        logger.error(f"Error fetching distinct documents from MongodDB: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not retrieve document list.")
 
 if __name__ == "__main__":
     import uvicorn
