@@ -1,18 +1,11 @@
 # Chatty
-This project implements a sophisticated conversational AI chatbot capable of engaging in dynamic conversations and answering questions based on a custom, updatable knowledge base. It utilizes Retrieval Augmented Generation (RAG) by integrating ChromaDB as a vector store for semantic search over ingested documents.
+## MongoDB Atlas Vector Search Integration Branch (`mongodb-vector-search`)
 
-Key Features:
+This branch contains an alternative implementation of the "Chatty" RAG chatbot, utilizing **MongoDB Atlas Vector Search** as the vector database instead of ChromaDB.
 
-- Backend: Robust and asynchronous API built with FastAPI (Python).
-- Conversational AI: Powered by AI21's Jamba-Mini language model.
-- Retrieval Augmented Generation (RAG): ChromaDB stores and searches document embeddings (e.g., from Sentence Transformers) to provide relevant context to the LLM.
-- Custom Knowledge Base: Includes a data ingestion pipeline (ingest_data.py) to load, chunk, embed, and store documents (PDF, TXT, MD) into ChromaDB.
-- Authentication: Secure JWT-based authentication for user registration and login.
-- Data Storage: MongoDB for user profiles and chat history.
-- Configurable: Designed to restrict answers to the knowledge base or allow more general responses based on configuration.
+**Key Differences from `main` (ChromaDB version):**
+*   **Vector Storage & Search:** Employs MongoDB Atlas for storing text embeddings and performing semantic similarity searches using the `$vectorSearch` aggregation stage.
+*   **Data Ingestion:** The `ingest_kb.py` script is modified to generate embeddings directly and load them, along with text chunks and metadata, into a dedicated MongoDB collection.
+*   **Application Logic:** The FastAPI application (`app.py`) queries MongoDB Atlas for relevant context to augment LLM prompts.
 
-# Installation
-```
-git clone github.com/nightmare-tech/chatty.git
-pip install -r requirements.txt
-```
+This branch demonstrates the adaptability of the RAG architecture to different vector store solutions. **Note:** Requires a MongoDB Atlas cluster with a configured Vector Search Index on the knowledge base collection.
