@@ -1,4 +1,5 @@
 kb_docs/
+temp/
 chroma_db_store/
 config.json
 data.json

@@ -1,18 +1,25 @@
 import requests
 import shlex
 import os
+import json
+from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.syntax import Syntax
 
 # --- Configuration ---
 BASE_URL = os.getenv("CHATTY_API_URL", "http://localhost:8000")
+PERSISTENT_ENDPOINT = "/evaluate"  # Renamed from /chat
+DYNAMIC_ENDPOINT = "/evaluate-with-docs" # Renamed from /query-with-docs
 
 # --- Application State ---
 APP_STATE = {
     "token": None,
     "user_email": None,
-    "docs_context": [],
+    "mode": "persistent",  # Default mode
+    "persistent_docs_context": [], # For 'set_docs'
+    "temp_docs_to_upload": [],   # For 'add_doc'
 }
 
 # --- Rich Console ---
@@ -21,44 +28,48 @@ console = Console()
 # --- Command Handler Functions ---
 
 def handle_help(*args):
-    """Displays the help message."""
-    table = Table(title="Chatty CLI Commands", show_header=False, box=None)
-    table.add_row("[bold cyan]login[/bold cyan]", "Log in to the service to start a session.")
-    table.add_row("[bold cyan]register[/bold cyan]", "Register a new user account.")
-    table.add_row("[bold cyan]logout[/bold cyan]", "End the current session.")
-    table.add_row("[bold cyan]list_docs[/bold cyan]", "List available documents in the knowledge base.")
-    table.add_row("[bold cyan]use_docs [file1.txt] ...[/bold cyan]", "Set the context to specific documents for subsequent chat messages.")
-    table.add_row("[bold cyan]use_docs *[/bold cyan]", "Shortcut to clear the document context (same as 'clear_docs').")
-    table.add_row("[bold cyan]clear_docs[/bold cyan]", "Clear the document context to query all documents again.")
+    """Displays the comprehensive help message for both modes."""
+    console.print(Panel("[bold]Chatty Decision Engine CLI[/bold]", subtitle="A tool for querying the RAG system.", border_style="blue"))
+    table = Table(title="Core Commands", show_header=False, box=None)
+    table.add_row("[bold cyan]mode [persistent|temporary][/bold cyan]", "Switch between modes. This clears any set document context.")
+    table.add_row("[bold cyan]login / register / logout[/bold cyan]", "Standard user session management.")
     table.add_row("[bold cyan]help[/bold cyan]", "Show this help message.")
-    table.add_row("[bold cyan]exit[/bold cyan]", "Exit the CLI application.")
-    table.add_row("[bold cyan]<any other text>[/bold cyan]", "Will be sent as a chat message.")
+    table.add_row("[bold cyan]exit / quit[/bold cyan]", "Exit the application.")
     console.print(table)
-
-def handle_register(args_str):
-    """Registers a new user."""
-    userid = console.input("[bold]Enter new User ID: [/bold]")
-    email = console.input("[bold]Enter your Email: [/bold]")
-    password = console.input("[bold]Enter Password: [/bold]", password=True)
     
-    if not all([userid, email, password]):
-        console.print("[bold red]All fields are required.[/bold red]")
-        return
-        
-    response = requests.post(f"{BASE_URL}/register", json={"userid": userid, "emailid": email, "password": password})
-    if response.status_code == 200:
-        console.print("[bold green]✔ Registration successful! Please use 'login' to continue.[/bold green]")
+    console.print("\n[bold]Persistent Mode Commands:[/bold] (Query the pre-loaded server knowledge base)")
+    table_p = Table(show_header=False, box=None)
+    table_p.add_row("[bold cyan]list_docs[/bold cyan]", "List available documents in the persistent KB.")
+    table_p.add_row("[bold cyan]set_docs [file1.pdf]...[/bold cyan]", "Set server-side document context for queries.")
+    table_p.add_row("[bold cyan]clear_docs[/bold cyan]", "Clear document context for this mode.")
+    console.print(table_p)
+
+    console.print("\n[bold]Temporary Mode Commands:[/bold] (Upload your own documents for a one-time query)")
+    table_t = Table(show_header=False, box=None)
+    table_t.add_row("[bold cyan]add_doc /path/to/file.pdf[/bold cyan]", "Stage a local document for the next query.")
+    table_t.add_row("[bold cyan]show_docs[/bold cyan]", "Show currently staged local documents.")
+    table_t.add_row("[bold cyan]clear_docs[/bold cyan]", "Clear staged local documents.")
+    console.print(table_t)
+
+    console.print("\n[bold]Querying:[/bold]")
+    console.print("Simply type your query and press Enter. The right action will be taken based on the current mode.")
+
+
+def handle_mode_switch(args_str):
+    """Switches the application mode and clears contexts."""
+    new_mode = args_str.strip().lower()
+    if new_mode in ["persistent", "temporary"]:
+        APP_STATE["mode"] = new_mode
+        console.print(f"[bold green]✔ Mode switched to: {new_mode}[/bold green]")
+        # Clear all contexts to avoid confusion
+        APP_STATE["persistent_docs_context"] = []
+        APP_STATE["temp_docs_to_upload"] = []
     else:
-        console.print(f"[bold red]❌ Registration failed:[/bold red] {response.json().get('detail', 'Unknown error')}")
+        console.print("[bold red]❌ Invalid mode. Use 'persistent' or 'temporary'.[/bold red]")
 
 def handle_login(args_str):
-    """Logs in and saves token to app state."""
     email = console.input("[bold]Email: [/bold]")
     password = console.input("[bold]Password: [/bold]", password=True)
-    if not all([email, password]):
-        console.print("[bold red]Email and password are required.[/bold red]")
-        return
-        
     try:
         response = requests.post(f"{BASE_URL}/login", data={"username": email, "password": password})
         if response.status_code == 200:
@@ -66,137 +77,148 @@ def handle_login(args_str):
             APP_STATE["user_email"] = email
             console.print("[bold green]✔ Login successful.[/bold green]")
         else:
-            console.print(f"[bold red]❌ Login failed:[/bold red] {response.json().get('detail', 'Invalid credentials')}")
-    except requests.exceptions.RequestException:
-        console.print(f"[bold red]Connection Error:[/bold red] Could not connect to the API at {BASE_URL}.")
+            console.print(f"[bold red]❌ Login failed: {response.json().get('detail', 'Invalid credentials')}[/bold red]")
+    except requests.exceptions.RequestException: console.print(f"[bold red]Connection Error to API at {BASE_URL}.[/bold red]")
+
+def handle_register(args_str):
+    userid = console.input("[bold]Enter new User ID: [/bold]")
+    email = console.input("[bold]Enter your Email: [/bold]")
+    password = console.input("[bold]Enter Password: [/bold]", password=True)
+    response = requests.post(f"{BASE_URL}/register", json={"userid": userid, "emailid": email, "password": password})
+    if response.status_code == 200: console.print("[bold green]✔ Registration successful. Please login.[/bold green]")
+    else: console.print(f"[bold red]❌ Registration failed: {response.json().get('detail', 'Unknown error')}[/bold red]")
 
 def handle_logout(*args):
-    """Logs out by clearing the session state."""
-    APP_STATE["token"] = None
-    APP_STATE["user_email"] = None
-    APP_STATE["docs_context"] = []
+    APP_STATE["token"], APP_STATE["user_email"], APP_STATE["persistent_docs_context"], APP_STATE["temp_docs_to_upload"] = None, None, [], []
     console.print("[bold yellow]You have been logged out.[/bold yellow]")
 
 def handle_list_docs(*args):
-    """Lists available documents."""
-    if not APP_STATE["token"]:
-        console.print("[bold red]You must be logged in first.[/bold red]")
-        return
+    if APP_STATE["mode"] != 'persistent': console.print("[bold red]This command is only available in 'persistent' mode.[/bold red]"); return
+    if not APP_STATE["token"]: console.print("[bold red]You must be logged in first.[/bold red]"); return
     headers = {"Authorization": f"Bearer {APP_STATE['token']}"}
     response = requests.get(f"{BASE_URL}/documents", headers=headers)
     if response.status_code == 200:
         docs = response.json().get("documents", [])
-        if not docs:
-            console.print("[yellow]No documents found in the knowledge base.[/yellow]")
-            return
-        table = Table("Available Knowledge Base Documents")
-        for doc in sorted(docs):
-            table.add_row(doc)
+        if not docs: console.print("[yellow]No documents found in persistent KB.[/yellow]"); return
+        table = Table("Available Documents in Persistent KB")
+        for doc in sorted(docs): table.add_row(doc)
         console.print(table)
+    else: console.print(f"[bold red]Error fetching documents: {response.json().get('detail', 'Unknown error')}[/bold red]")
+
+def handle_set_docs(args_str):
+    if APP_STATE["mode"] != 'persistent': console.print("[bold red]This command is only available in 'persistent' mode.[/bold red]"); return
+    if not args_str or args_str.strip() == '*': APP_STATE["persistent_docs_context"] = []; console.print("[bold yellow]Persistent document context cleared.[/bold yellow]"); return
+    APP_STATE["persistent_docs_context"] = shlex.split(args_str)
+    console.print(f"[bold yellow]Persistent document context set to: {APP_STATE['persistent_docs_context']}[/bold yellow]")
+
+def handle_add_doc(args_str):
+    if APP_STATE["mode"] != 'temporary': console.print("[bold red]This command is only available in 'temporary' mode.[/bold red]"); return
+    if not args_str: console.print("[bold red]Usage: add_doc /path/to/file.pdf ...[/bold red]"); return
+    files_to_add = shlex.split(args_str)
+    for file_path in files_to_add:
+        if os.path.exists(file_path) and os.path.isfile(file_path):
+            abs_path = os.path.abspath(file_path)
+            if abs_path not in APP_STATE["temp_docs_to_upload"]: APP_STATE["temp_docs_to_upload"].append(abs_path); console.print(f"[green]Staged:[/green] {abs_path}")
+            else: console.print(f"[yellow]Skipped (already staged):[/yellow] {abs_path}")
+        else: console.print(f"[bold red]Error: File not found:[/bold red] {file_path}")
+
+def handle_show_docs(*args):
+    title = ""
+    docs_list = []
+    if APP_STATE["mode"] == 'persistent':
+        title = "Document Context Set for Persistent Query"
+        docs_list = APP_STATE["persistent_docs_context"]
     else:
-        console.print(f"[bold red]Error fetching documents: {response.json().get('detail', 'Unknown error')}[/bold red]")
-        
+        title = "Local Documents Staged for Temporary Query"
+        docs_list = APP_STATE["temp_docs_to_upload"]
+    
+    if not docs_list: console.print("[yellow]No documents are currently set for this mode.[/yellow]"); return
+    table = Table(title)
+    for doc in docs_list: table.add_row(doc)
+    console.print(table)
+
 def handle_clear_docs(*args):
-    """Clears the document context."""
-    APP_STATE["docs_context"] = []
-    console.print("[bold yellow]Document context cleared. Chat will now query all documents.[/bold yellow]")
+    if APP_STATE["mode"] == 'persistent': APP_STATE["persistent_docs_context"] = []
+    else: APP_STATE["temp_docs_to_upload"] = []
+    console.print("[bold yellow]Current document context has been cleared.[/bold yellow]")
 
-# --- UPDATED FUNCTION ---
-def handle_use_docs(args_str):
-    """
-    Sets the document context for the next chat.
-    Using '*' as the argument will clear the context.
-    """
-    if not args_str:
-        console.print("[bold red]Usage: use_docs [file1.pdf] [file2.txt] ... or use_docs * to clear.[/bold red]")
-        return
+def handle_query(query_text):
+    if not APP_STATE["token"]: console.print("[bold red]You must be logged in to run a query.[/bold red]"); return
+    
+    if APP_STATE["mode"] == 'persistent':
+        handle_persistent_query(query_text)
+    else: # mode == 'temporary'
+        handle_temporary_query(query_text)
 
-    # Check for the special '*' wildcard to clear the context
-    if args_str.strip() == '*':
-        handle_clear_docs() # Re-use the existing clear function
-        return # Exit the function
-
-    # If not '*', proceed with the normal file processing
-    try:
-        # Use shlex to handle filenames with spaces if they are quoted
-        APP_STATE["docs_context"] = shlex.split(args_str)
-        console.print(f"[bold yellow]Document context set to: {APP_STATE['docs_context']}. The next chat will only query these files.[/bold yellow]")
-    except ValueError as e:
-        console.print(f"[bold red]Error parsing filenames (check for unmatched quotes): {e}[/bold red]")
-
-
-def handle_chat(message):
-    """Sends a message to the chatbot."""
-    if not APP_STATE["token"]:
-        console.print("[bold red]You must be logged in to chat.[/bold red]")
-        return
-        
+def handle_persistent_query(query):
     headers = {"Authorization": f"Bearer {APP_STATE['token']}"}
-    payload = {"message": message}
-    if APP_STATE["docs_context"]:
-        payload["source_files"] = APP_STATE["docs_context"]
-
+    # Match the new Pydantic model 'QueryRequest' in app.py
+    payload = {"query_text": query, "source_files": APP_STATE["persistent_docs_context"]}
     try:
-        with console.status("[bold green]Thinking...[/bold green]"):
-            response = requests.post(f"{BASE_URL}/chat", headers=headers, json=payload)
+        with console.status("[bold green]Querying persistent KB...[/bold green]"):
+            response = requests.post(f"{BASE_URL}{PERSISTENT_ENDPOINT}", headers=headers, json=payload)
         
-        if response.status_code == 200:
-            ai_response = response.json().get("response", "No response content.")
-            console.print(Panel(ai_response, title="Chatbot", border_style="magenta", title_align="left"))
-        else:
-            console.print(f"[bold red]Error: {response.json().get('detail', 'Unknown error')}[/bold red]")
-    except requests.exceptions.RequestException:
-        console.print(f"[bold red]Connection Error:[/bold red] Could not connect to the API at {BASE_URL}.")
+        if response.status_code == 200: display_structured_response(response.json())
+        else: console.print(f"[bold red]Error: {response.status_code} - {response.json().get('detail', 'Unknown error')}[/bold red]")
+    except requests.exceptions.RequestException: console.print(f"[bold red]Connection Error.[/bold red]")
 
-# --- Command Dispatcher ---
+def handle_temporary_query(query):
+    if not APP_STATE["temp_docs_to_upload"]: console.print("[bold red]No documents staged. Use 'add_doc' first.[/bold red]"); return
+    
+    headers = {"Authorization": f"Bearer {APP_STATE['token']}"}
+    data_payload = {'query': query}; files_payload = []; file_handles = []
+    
+    try:
+        for file_path in APP_STATE["temp_docs_to_upload"]:
+            handle = open(file_path, 'rb'); file_handles.append(handle)
+            files_payload.append(('files', (os.path.basename(file_path), handle)))
+        
+        with console.status("[bold green]Uploading documents and processing...[/bold green]"):
+            response = requests.post(f"{BASE_URL}{DYNAMIC_ENDPOINT}", headers=headers, data=data_payload, files=files_payload)
+
+        if response.status_code == 200: display_structured_response(response.json())
+        else: console.print(f"[bold red]Error: {response.status_code} - {response.json().get('detail', 'Unknown error')}[/bold red]")
+    except requests.exceptions.RequestException: console.print(f"[bold red]Connection Error.[/bold red]")
+    finally:
+        for handle in file_handles: handle.close()
+
+def display_structured_response(data):
+    try:
+        json_str = json.dumps(data, indent=2)
+        syntax = Syntax(json_str, "json", theme="solarized-dark", line_numbers=True)
+        console.print(Panel(syntax, title="AI Decision Engine Response", border_style="magenta", title_align="left"))
+    except (json.JSONDecodeError, TypeError): console.print(Panel(str(data), title="AI Response (Raw)", border_style="magenta"))
+
 COMMANDS = {
-    "help": handle_help,
-    "register": handle_register,
-    "login": handle_login,
-    "logout": handle_logout,
-    "list_docs": handle_list_docs,
-    "use_docs": handle_use_docs,
-    "clear_docs": handle_clear_docs,
-    "exit": lambda *args: exit(),
-    "quit": lambda *args: exit(),
+    "help": handle_help, "mode": handle_mode_switch,
+    "register": handle_register, "login": handle_login, "logout": handle_logout,
+    "list_docs": handle_list_docs, "set_docs": handle_set_docs,
+    "add_doc": handle_add_doc, "show_docs": handle_show_docs, "clear_docs": handle_clear_docs,
+    "exit": lambda *args: exit(), "quit": lambda *args: exit(),
 }
 
 def get_current_prompt():
-    """Generates the dynamic prompt string."""
     user_part = APP_STATE.get("user_email", "logged out")
+    mode_part = f" ({APP_STATE['mode']})"
     docs_part = ""
-    if APP_STATE.get("docs_context"):
-        num_docs = len(APP_STATE['docs_context'])
-        docs_part = f" [{num_docs} doc{'s' if num_docs > 1 else ''}]"
-    
-    return f"chatty ({user_part}){docs_part} > "
+    docs_list = APP_STATE["persistent_docs_context"] if APP_STATE["mode"] == 'persistent' else APP_STATE["temp_docs_to_upload"]
+    num_docs = len(docs_list)
+    if num_docs > 0: docs_part = f" [{num_docs} doc{'s' if num_docs > 1 else ''}]"
+    return f"chatty{mode_part} ({user_part}){docs_part} > "
 
 def main():
-    """The main interactive loop."""
-    console.print("[bold]Welcome to the Chatty CLI![/bold] Type 'help' for a list of commands.")
+    console.print("[bold]Welcome to the Chatty Decision Engine CLI![/bold] Type 'help' for commands.")
     while True:
         try:
-            prompt_text = get_current_prompt()
-            user_input = console.input(prompt_text).strip()
-
-            if not user_input:
-                continue
-
+            user_input = console.input(get_current_prompt()).strip()
+            if not user_input: continue
             parts = user_input.split(' ', 1)
             command = parts[0].lower()
             args = parts[1] if len(parts) > 1 else ""
-
-            if command in COMMANDS:
-                COMMANDS[command](args)
-            else:
-                handle_chat(user_input)
-        
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[bold]Exiting...[/bold]")
-            break
-        except SystemExit:
-            console.print("\n[bold]Exiting...[/bold]")
-            break
+            if command in COMMANDS: COMMANDS[command](args)
+            else: handle_query(user_input)
+        except (KeyboardInterrupt, EOFError, SystemExit):
+            console.print("\n[bold]Exiting...[/bold]"); break
 
 if __name__ == "__main__":
     main()
