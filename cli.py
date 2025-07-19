@@ -9,17 +9,17 @@ from rich.table import Table
 from rich.syntax import Syntax
 
 # --- Configuration ---
-BASE_URL = os.getenv("CHATTY_API_URL", "http://localhost:8000")
-PERSISTENT_ENDPOINT = "/evaluate"  # Renamed from /chat
-DYNAMIC_ENDPOINT = "/evaluate-with-docs" # Renamed from /query-with-docs
+BASE_URL = os.getenv("CLAUSECOMPASS_API_URL", "http://localhost:8000") # Renamed env var for consistency
+PERSISTENT_ENDPOINT = "/evaluate"
+DYNAMIC_ENDPOINT = "/evaluate-with-docs"
 
 # --- Application State ---
 APP_STATE = {
     "token": None,
     "user_email": None,
-    "mode": "persistent",  # Default mode
-    "persistent_docs_context": [], # For 'set_docs'
-    "temp_docs_to_upload": [],   # For 'add_doc'
+    "mode": "persistent",
+    "persistent_docs_context": [],
+    "temp_docs_to_upload": [],
 }
 
 # --- Rich Console ---
@@ -29,7 +29,7 @@ console = Console()
 
 def handle_help(*args):
     """Displays the comprehensive help message for both modes."""
-    console.print(Panel("[bold]Chatty Decision Engine CLI[/bold]", subtitle="A tool for querying the RAG system.", border_style="blue"))
+    console.print(Panel("[bold]ClauseCompass Decision Engine CLI[/bold] 🧭", subtitle="A tool for querying the RAG system.", border_style="blue"))
     table = Table(title="Core Commands", show_header=False, box=None)
     table.add_row("[bold cyan]mode [persistent|temporary][/bold cyan]", "Switch between modes. This clears any set document context.")
     table.add_row("[bold cyan]login / register / logout[/bold cyan]", "Standard user session management.")
@@ -61,7 +61,6 @@ def handle_mode_switch(args_str):
     if new_mode in ["persistent", "temporary"]:
         APP_STATE["mode"] = new_mode
         console.print(f"[bold green]✔ Mode switched to: {new_mode}[/bold green]")
-        # Clear all contexts to avoid confusion
         APP_STATE["persistent_docs_context"] = []
         APP_STATE["temp_docs_to_upload"] = []
     else:
@@ -136,7 +135,7 @@ def handle_show_docs(*args):
     table = Table(title)
     for doc in docs_list: table.add_row(doc)
     console.print(table)
-
+    
 def handle_clear_docs(*args):
     if APP_STATE["mode"] == 'persistent': APP_STATE["persistent_docs_context"] = []
     else: APP_STATE["temp_docs_to_upload"] = []
@@ -152,7 +151,6 @@ def handle_query(query_text):
 
 def handle_persistent_query(query):
     headers = {"Authorization": f"Bearer {APP_STATE['token']}"}
-    # Match the new Pydantic model 'QueryRequest' in app.py
     payload = {"query_text": query, "source_files": APP_STATE["persistent_docs_context"]}
     try:
         with console.status("[bold green]Querying persistent KB...[/bold green]"):
@@ -203,11 +201,14 @@ def get_current_prompt():
     docs_part = ""
     docs_list = APP_STATE["persistent_docs_context"] if APP_STATE["mode"] == 'persistent' else APP_STATE["temp_docs_to_upload"]
     num_docs = len(docs_list)
-    if num_docs > 0: docs_part = f" [{num_docs} doc{'s' if num_docs > 1 else ''}]"
-    return f"chatty{mode_part} ({user_part}){docs_part} > "
+    if num_docs > 0:
+        context_type = "docs" if APP_STATE["mode"] == 'persistent' else "staged"
+        docs_part = f" [{num_docs} {context_type}]"
+    
+    return f"ClauseCompass{mode_part} ({user_part}){docs_part} > "
 
 def main():
-    console.print("[bold]Welcome to the Chatty Decision Engine CLI![/bold] Type 'help' for commands.")
+    console.print("[bold]Welcome to the ClauseCompass Decision Engine CLI! 🧭[/bold] Type 'help' for commands.")
     while True:
         try:
             user_input = console.input(get_current_prompt()).strip()
