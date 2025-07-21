@@ -2,8 +2,10 @@ import logging
 import os
 import json
 import tempfile
+import uuid
+import re
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from datetime import datetime, timedelta, timezone
 from jose import JWTError, jwt
@@ -29,10 +31,11 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # --- FastAPI App Initialization ---
-app = FastAPI()
+app = FastAPI(title="ClauseCompass API", description="An AI-powered decision engine for document analysis.")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# --- Environment Variable Loading & Validation ---
+# --- Global State & Environment Variables ---
+SESSION_VECTOR_STORES = {}  # For Temporary Mode
 AI21_API_KEY_ENV = os.getenv("AI21_API_KEY")
 MONGO_USER_ENV = os.getenv("USERN")
 MONGO_PASS_ENV = os.getenv("PASSW")
@@ -81,7 +84,6 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 # --- Pydantic Models ---
-# Renamed for clarity, as discussed
 class QueryRequest(BaseModel):
     query_text: str
     source_files: Optional[List[str]] = Field(default_factory=list)
@@ -91,8 +93,7 @@ class RegisterUser(BaseModel):
     emailid: str
     password: str
 
-# --- Utility Functions (Auth) ---
-# ... (hash_password, verify_password, create_access_token, decode_access_token, get_current_user remain the same) ...
+# --- Utility Functions ---
 def hash_password(password: str): return pwd_context.hash(password)
 def verify_password(plain: str, hashed: str): return pwd_context.verify(plain, hashed)
 def create_access_token(data: dict, expires_delta: timedelta = None):
@@ -112,24 +113,32 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     if user_document is None: raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return user_document
 
+def clean_and_parse_json(llm_response_str: str) -> dict:
+    logger.info(f"Raw LLM Response String: {llm_response_str}")
+    try:
+        json_match = re.search(r'\{.*\}', llm_response_str, re.DOTALL)
+        if json_match:
+            clean_json_str = json_match.group(0)
+            logger.info(f"Cleaned JSON String for parsing: {clean_json_str}")
+            return json.loads(clean_json_str)
+        else:
+            raise json.JSONDecodeError("Could not find JSON object in LLM response", llm_response_str, 0)
+    except json.JSONDecodeError:
+        logger.error(f"LLM did not return valid JSON, even after cleaning. Raw response: {llm_response_str}", exc_info=True)
+        return {"Decision": "Error", "Amount": 0, "Justification": "AI failed to generate a valid structured response."}
+
 # --- API Endpoints ---
 
-# Renamed for clarity
 @app.post("/evaluate", summary="Evaluate a query against the persistent Knowledge Base")
 async def evaluate_endpoint(
     query_req: QueryRequest,
     current_user: dict = Depends(get_current_user)
 ):
-    """
-    Handles queries against the pre-ingested, persistent knowledge base in MongoDB.
-    This is a stateless, transactional endpoint.
-    """
     user_query = query_req.query_text
     structured_response = {}
     used_knowledge_base = False
 
     if app_embedding_model is None:
-        logger.error("Embedding model not available. Cannot perform KB lookup.")
         raise HTTPException(status_code=503, detail="AI embedding service is unavailable.")
 
     try:
@@ -137,18 +146,14 @@ async def evaluate_endpoint(
 
         vector_search_stage = {
             "$vectorSearch": {
-                "index": ATLAS_VECTOR_SEARCH_INDEX_NAME,
-                "path": "embedding_vector",
-                "queryVector": user_query_embedding,
-                "numCandidates": 100,
-                "limit": 5
+                "index": ATLAS_VECTOR_SEARCH_INDEX_NAME, "path": "embedding_vector",
+                "queryVector": user_query_embedding, "numCandidates": 100, "limit": 5
             }
         }
         if query_req.source_files:
             vector_search_stage["$vectorSearch"]["filter"] = { "metadata.source_document": { "$in": query_req.source_files } }
-
-        vector_search_pipeline = [vector_search_stage, {"$project": {"_id": 0, "text_chunk": 1, "metadata": 1, "score": {"$meta": "vectorSearchScore"}}}]
         
+        vector_search_pipeline = [vector_search_stage, {"$project": {"_id": 0, "text_chunk": 1, "metadata": 1, "score": {"$meta": "vectorSearchScore"}}}]
         retrieved_mongo_results = list(mongo_kb_collection.aggregate(vector_search_pipeline))
 
         if retrieved_mongo_results and retrieved_mongo_results[0]['score'] >= MONGO_SCORE_THRESHOLD:
@@ -157,92 +162,77 @@ async def evaluate_endpoint(
 
             context_for_llm_str = "\n--- Provided Documents Context ---\n"
             for i, doc in enumerate(retrieved_mongo_results):
-                context_for_llm_str += f"Context Document {i+1} (Source: {doc.get('metadata', {}).get('source_document', 'N/A')}):\n{doc.get('text_chunk', '')}\n\n"
+                metadata = doc.get('metadata', {})
+                source_doc = metadata.get('source_document', 'N/A')
+                clause_section = metadata.get('policy_section', '')
+                clause_num = metadata.get('policy_clause_num', '')
+                citation_ref = f"[{clause_section}, Clause {clause_num} (Source: {source_doc})]"
+                context_for_llm_str += f"Citation Reference: {citation_ref}\n"
+                context_for_llm_str += f"Content: {doc.get('text_chunk', '')}\n\n"
             context_for_llm_str += "--- End of Provided Documents Context ---\n"
+            logger.info(f"Context provided to llm\n: {context_for_llm_str}")
 
             system_prompt_rag = (
-                "You are a precise insurance claims adjudicator API. Your only function is to return a structured JSON object. Do NOT add any text before or after the JSON.\n\n"
-                "TASK: Follow these steps precisely:\n"
-                "1.  **Analyze the User Query:** Identify the user's condition/procedure and the circumstances (e.g., illness vs. accident).\n"
-                "2.  **Review the Provided Context:** Scan all provided policy clauses for relevance to the user's condition and circumstances.\n"
-                "3.  **Check for Exclusions & Waiting Periods:** First, determine if the condition is explicitly excluded or falls under a waiting period (e.g., 30-day, 24-month specified disease).\n"
-                "4.  **CRUCIAL - Check for Exceptions:** If a waiting period or exclusion applies, you MUST re-scan the context to see if there is an exception to that rule (e.g., 'unless necessitated due to an Accident'). The presence of an accident in the user query is a critical exception.\n"
-                "5.  **Formulate Decision:** Based on this step-by-step evaluation, make your final 'Decision'.\n"
-                "6.  **Construct JSON:** Populate the JSON with your final decision. For the 'Justification', list EVERY relevant clause you considered, both for and against the decision, and cite the exact 'Citation Reference' for each.\n\n"
-                "JSON SCHEMA TO FOLLOW:\n"
-                "SCHEMA: {\"Decision\": \"...\", \"Amount\": ..., \"Justification\": [{\"reason\": \"...\", \"clause\": \"...\"}]}\n\n"
-                "\n\n"
+                "You are a stateless, rule-based JSON generation API. Your ONLY function is to analyze a user query and provided context and return a single, valid JSON object. "
+                "Your entire response MUST be the JSON object itself, with no other text.\n\n"
+
+                "REASONING RULES:\n"
+                "1.  **Analyze Query & Context:** Base your decision ONLY on the provided context and the user's query. Do NOT assume facts not explicitly stated (e.g., do not assume an 'Accident' if not mentioned).\n\n"
+                "2.  **Check for Overriding Rules First:** Before approving, you MUST check for specific conditions that would reject the claim:\n"
+                "    - **Definitions:** Does the situation violate a core definition (e.g., is the location a 'health spa' instead of a 'Hospital')?\n"
+                "    - **Waiting Periods:** Does the claim fall within the 30-day, 24-month, or 36-month waiting periods?\n"
+                "    - **Exclusions:** Is the condition explicitly excluded (e.g., 'Cosmetic Surgery', 'Hazardous Sports')?\n\n"
+                "3.  **Prioritize Exceptions:** If a waiting period or exclusion applies, you MUST check for an exception. An **'Accident'** is a critical exception that overrides most waiting periods.\n\n"
+                "4.  **Handle Financials:** Check for specific financial rules like **Sub-limits** (e.g., for Robotic Surgery), **Co-payments** (e.g., Zone-based), or **Deductions** (e.g., Room Rent). If these apply, the 'Decision' MUST be 'Partially Approved' or similar. If no specific amount or percentage is in the context, the 'Amount' MUST be null.\n\n"
+
+                "JSON OUTPUT REQUIREMENTS:\n"
+                "-   Return ONLY the JSON. 'Decision' must be one of 'Approved', 'Rejected', 'Partially Approved', 'Conditional'.\n"
+                "-   The 'Justification' must cite the specific reason and clause from the context.\n\n"
+                
                 f"CONTEXT:\n{context_for_llm_str}"
             )
             final_user_query = (
-                f"User query: '{user_query}'.\n\n"
-                "Now, generate ONLY the raw JSON object as your response."
+                f"User Query: '{user_query}'.\n\n"
+                "=== TASK ===\n"
+                "Based on the query and the context provided in the system prompt, generate ONLY the raw JSON object as your response."
             )
-
             final_messages_for_ai21 = [
                 ChatMessage(role="system", content=system_prompt_rag),
                 ChatMessage(role="user", content=final_user_query)
             ]
-
-            ai_api_response = ai21_client.chat.completions.create(model="jamba-mini-1.6-2025-03", messages=final_messages_for_ai21)
-            response_json_str = ai_api_response.choices[0].message.content
-            logger.info(f"Raw LLM Response String: {response_json_str}")
-            try:
-                start_index = response_json_str.find('{')
-                end_index = response_json_str.rfind('}')
-                if start_index != -1 and end_index != -1:
-                    # Extract the substring that is the actual JSON
-                    clean_json_str = response_json_str[start_index : end_index + 1]
-                    logger.info(f"Cleaned JSON String for parsing: {clean_json_str}")
-                    structured_response = json.loads(clean_json_str)
-                else:
-                    raise json.JSONDecodeError("Could not find JSON object in LLM response", response_json_str, 0)
-            except json.JSONDecodeError as e:
-                logger.error(f"LLM did not return valid JSON, even after cleaning. Raw response: {response_json_str}", exc_info=True)
-                structured_response = {"Decision": "Error", "Amount": 0, "Justification": "AI failed to generate a valid structured response."}
-
             
+            ai_api_response = ai21_client.chat.completions.create(model="jamba-mini-1.6-2025-03", messages=final_messages_for_ai21)
+            structured_response = clean_and_parse_json(ai_api_response.choices[0].message.content)
         else:
             structured_response = {"Decision": "Cannot Determine", "Amount": 0, "Justification": OUT_OF_KB_SCOPE_MESSAGE}
 
-    # except json.JSONDecodeError:
-    #     logger.error("LLM did not return valid JSON in /chat endpoint.")
-    #     structured_response = {"Decision": "Error", "Amount": 0, "Justification": "AI failed to generate a structured response."}
     except Exception as e:
-        logger.error(f"Error during RAG process in /chat: {e}", exc_info=True)
+        logger.error(f"Error during RAG process in /evaluate: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An error occurred while processing your request.")
 
-    # Store transaction log
     users_collection.update_one(
         {"userid": current_user["userid"]},
         {"$push": {"chat_history": {"$each": [{"role": "user", "content": user_query, "timestamp": datetime.now(timezone.utc)}, {"role": "assistant", "content": structured_response, "timestamp": datetime.now(timezone.utc), "used_knowledge_base": used_knowledge_base}]}}}
     )
-
     return structured_response
 
-@app.post("/evaluate-with-docs", summary="Evaluate a query with dynamically uploaded documents")
-async def evaluate_with_uploaded_documents(
-    query: str = File(...), # Use File to send with multipart
+@app.post("/session/documents", summary="Upload documents to start a temporary RAG session")
+async def upload_documents_for_session(
     files: List[UploadFile] = File(...),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    background_tasks: BackgroundTasks = BackgroundTasks()
 ):
-    """
-    Handles on-the-fly RAG for user-uploaded documents.
-    """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files were uploaded.")
-    if app_embedding_model is None:
-        raise HTTPException(status_code=503, detail="AI embedding service is unavailable.")
+    user_id = current_user["userid"]
+    if user_id in SESSION_VECTOR_STORES:
+        logger.info(f"Clearing previous session for user: {user_id}")
+        del SESSION_VECTOR_STORES[user_id]
+    if not files: raise HTTPException(status_code=400, detail="No files were uploaded.")
 
-    # ... (The logic for this endpoint was already clean and does not need changes) ...
-    chunked_documents = []
-    temp_files = []
+    chunked_documents = []; temp_files_to_clean = []
     try:
-        # The existing logic is correct and self-contained
         for uploaded_file in files:
             with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_file.filename).suffix) as tmp:
-                tmp.write(await uploaded_file.read())
-                temp_files.append(tmp.name)
+                tmp.write(await uploaded_file.read()); temp_files_to_clean.append(tmp.name)
             
             file_extension = Path(tmp.name).suffix.lower()
             if file_extension == ".pdf": loader = PyPDFLoader(tmp.name)
@@ -256,50 +246,88 @@ async def evaluate_with_uploaded_documents(
 
         if not chunked_documents: raise HTTPException(status_code=400, detail="Could not process any uploaded documents.")
 
-        temp_chroma_client = chromadb.Client()
-        temp_collection = temp_chroma_client.create_collection(name="hackathon_temp_rag")
+        session_chroma_client = chromadb.Client()
+        collection_name = f"session_collection_{user_id}_{uuid.uuid4().hex}"
+        session_collection = session_chroma_client.create_collection(name=collection_name)
         
         docs_to_embed = [chunk.page_content for chunk in chunked_documents]
         embeddings_to_add = app_embedding_model.encode(docs_to_embed).tolist()
 
-        temp_collection.add(
-            ids=[f"{chunk.metadata.get('source', 'doc')}_chunk_{i}" for i, chunk in enumerate(chunked_documents)],
-            embeddings=embeddings_to_add,
-            documents=docs_to_embed,
-            metadatas=[chunk.metadata for chunk in chunked_documents]
+        session_collection.add(
+            ids=[f"chunk_{i}" for i in range(len(chunked_documents))],
+            embeddings=embeddings_to_add, documents=docs_to_embed, metadatas=[chunk.metadata for chunk in chunked_documents]
         )
-        retrieved_docs = temp_collection.query(query_texts=[query], n_results=5)
-        retrieved_docs_content = retrieved_docs.get('documents', [[]])[0]
+        
+        SESSION_VECTOR_STORES[user_id] = session_collection
+        logger.info(f"Successfully created and cached vector store for user: {user_id}")
+        return {"message": f"Successfully processed {len(files)} documents. You can now query them.", "session_user": user_id}
+    except Exception as e:
+        logger.error(f"Error creating session vector store for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create session knowledge base.")
+    finally:
+        for path in temp_files_to_clean: background_tasks.add_task(os.unlink, path)
 
-        if not retrieved_docs_content: return {"Decision": "Cannot Determine", "Amount": 0, "Justification": "No relevant information found in the uploaded documents for the given query."}
+@app.post("/session/query", summary="Query the current temporary session")
+async def query_session_documents(
+    query_req: QueryRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    user_id = current_user["userid"]
+    user_query = query_req.query_text
+    if user_id not in SESSION_VECTOR_STORES:
+        raise HTTPException(status_code=404, detail="No active document session found. Please upload documents first.")
+
+    session_collection = SESSION_VECTOR_STORES[user_id]
+    try:
+        retrieved_docs = session_collection.query(query_texts=[user_query], n_results=5)
+        retrieved_docs_content = retrieved_docs.get('documents', [[]])[0]
+        
+        if not retrieved_docs_content:
+            return {"Decision": "Cannot Determine", "Amount": 0, "Justification": "No relevant information found in uploaded documents for this query."}
 
         context_for_llm_str = "\n--- Provided Documents Context ---\n"
         for doc_text in retrieved_docs_content: context_for_llm_str += f"Context: {doc_text}\n\n"
         context_for_llm_str += "--- End of Provided Documents Context ---\n"
+        
+        # A new, more concise "Medium" prompt
 
         system_prompt_rag = (
-            "You are an expert insurance claims adjudicator. Your task is to make a decision based on the user's query and the provided context from the uploaded documents. "
-            "Evaluate the user's details against the policy clauses found in the context. If the context is insufficient, state that. "
-            "Do NOT use any external knowledge. ONLY output your final decision in a structured JSON format with keys: 'Decision', 'Amount', and 'Justification'."
-            f"{context_for_llm_str}"
+            "You are a stateless, rule-based JSON generation API. Your ONLY function is to analyze a user query and provided context and return a single, valid JSON object. "
+            "Your entire response MUST be the JSON object itself, with no other text.\n\n"
+
+            "REASONING RULES:\n"
+            "1.  **Analyze Query & Context:** Base your decision ONLY on the provided context and the user's query. Do NOT assume facts not explicitly stated (e.g., do not assume an 'Accident' if not mentioned).\n\n"
+            "2.  **Check for Overriding Rules First:** Before approving, you MUST check for specific conditions that would reject the claim:\n"
+            "    - **Definitions:** Does the situation violate a core definition (e.g., is the location a 'health spa' instead of a 'Hospital')?\n"
+            "    - **Waiting Periods:** Does the claim fall within the 30-day, 24-month, or 36-month waiting periods?\n"
+            "    - **Exclusions:** Is the condition explicitly excluded (e.g., 'Cosmetic Surgery', 'Hazardous Sports')?\n\n"
+            "3.  **Prioritize Exceptions:** If a waiting period or exclusion applies, you MUST check for an exception. An **'Accident'** is a critical exception that overrides most waiting periods.\n\n"
+            "4.  **Handle Financials:** Check for specific financial rules like **Sub-limits** (e.g., for Robotic Surgery), **Co-payments** (e.g., Zone-based), or **Deductions** (e.g., Room Rent). If these apply, the 'Decision' MUST be 'Partially Approved' or similar. If no specific amount or percentage is in the context, the 'Amount' MUST be null.\n\n"
+
+            "JSON OUTPUT REQUIREMENTS:\n"
+            "-   Return ONLY the JSON. 'Decision' must be one of 'Approved', 'Rejected', 'Partially Approved', 'Conditional'.\n"
+            "-   The 'Justification' must cite the specific reason and clause from the context.\n\n"
+            
+            f"CONTEXT:\n{context_for_llm_str}"
         )
-        final_messages_for_ai21 = [ChatMessage(role="system", content=system_prompt_rag), ChatMessage(role="user", content=query)]
+
+        # And still use the "Final Command" user message
+        final_user_query = (
+            f"User Query: '{user_query}'.\n\n"
+            "=== TASK ===\n"
+            "Based on the query and the context provided, generate ONLY the raw JSON object as your response."
+        )
+       
+        final_messages_for_ai21 = [ChatMessage(role="system", content=system_prompt_rag), ChatMessage(role="user", content=final_user_query)]
         
         ai_api_response = ai21_client.chat.completions.create(model="jamba-mini-1.6-2025-03", messages=final_messages_for_ai21)
-        response_json_str = ai_api_response.choices[0].message.content
-        return json.loads(response_json_str)
+        return clean_and_parse_json(ai_api_response.choices[0].message.content)
 
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=500, detail="Failed to get a structured response from the AI.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
-    finally:
-        for temp_file_path in temp_files:
-            if os.path.exists(temp_file_path): os.unlink(temp_file_path)
-
+        logger.error(f"Error querying session for user {user_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An error occurred during session query.")
 
 @app.get("/documents", summary="List available documents in the persistent KB")
-# ... (this endpoint is fine) ...
 async def list_available_documents(current_user: dict = Depends(get_current_user)):
     try:
         distinct_files = mongo_kb_collection.distinct("metadata.source_document")
@@ -308,37 +336,28 @@ async def list_available_documents(current_user: dict = Depends(get_current_user
         logger.error(f"Error fetching distinct documents from MongoDB: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not retrieve document list.")
 
-
-# --- Authentication Endpoints ---
 @app.post("/register")
 async def register_user_endpoint(registration_data: RegisterUser):
-    # ... (this endpoint is fine, but we'll apply the chat_history: [] change) ...
-    if users_collection.find_one({"emailid": registration_data.emailid}): raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User with this email already exists")
-    if users_collection.find_one({"userid": registration_data.userid}): raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="User with this userid already exists.")
-
+    if users_collection.find_one({"emailid": registration_data.emailid}): raise HTTPException(status_code=400, detail="User with this email already exists")
+    if users_collection.find_one({"userid": registration_data.userid}): raise HTTPException(status_code=400, detail="User with this userid already exists.")
+    
     hashed_pass = hash_password(registration_data.password)
     user_document = {
-        "userid": registration_data.userid, 
-        "emailid": registration_data.emailid, 
-        "password": hashed_pass, 
-        "chat_history": [], # CORRECT: Initialize as empty
-        "created_at": datetime.now(timezone.utc) # Good practice
+        "userid": registration_data.userid, "emailid": registration_data.emailid, 
+        "password": hashed_pass, "chat_history": [],
+        "created_at": datetime.now(timezone.utc)
     }
     users_collection.insert_one(user_document)
     return {"message": "User registered successfully", "userid": registration_data.userid}
 
-
 @app.post("/login")
-# ... (this endpoint is fine) ...
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = users_collection.find_one({"emailid": form_data.username})
     if not user or not verify_password(form_data.password, user["password"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect email or password", headers={"WWW-Authenticate": "Bearer"})
+        raise HTTPException(status_code=401, detail="Incorrect email or password", headers={"WWW-Authenticate": "Bearer"})
     token = create_access_token(data={"sub": user["userid"]})
     return {"access_token": token, "token_type": "bearer"}
 
-
-# --- Main Guard ---
 if __name__ == "__main__":
     import uvicorn
     logger.info("Starting FastAPI application with Uvicorn...")
