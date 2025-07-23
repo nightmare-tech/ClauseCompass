@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.git
+.gitignore
+venv/
+chroma_db_store/
+# Add any other local-only files or directories
